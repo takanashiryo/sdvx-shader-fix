@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract/rewrite SDVX HLSL, compile with fxc, emit shaders_bytecode.h
 
-Matched at runtime by (src_len, profile, entry) when Wine D3DX fails.
+Matched at runtime by original source content, length, profile and entry.
 REWRITE entries compile alternate register-based HLSL for effect-style
 sources that use illegal sampler_state in D3DXCompileShader.
 
@@ -11,21 +11,27 @@ Sources are pulled by marker+length from versioned soundvoltex-*.dll dumps
 from __future__ import annotations
 
 import os
+import argparse
+import glob
+import hashlib
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+SAMPLES = os.path.join(ROOT, "samples")
 FXC = r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe"
 OUT_H = os.path.join(ROOT, "shaders_bytecode.h")
 
-DLL_LATE = os.path.join(ROOT, "soundvoltex-2025120900.dll")  # Exceed/Nabla EXTRACT + Cubism Normal 760
-DLL_MID = os.path.join(ROOT, "soundvoltex-2021121400.dll")  # Exceed-era full Cubism FX (4157)
-DLL_EARLY = os.path.join(ROOT, "soundvoltex-2020011500.dll")  # Early full Cubism FX (3130)
+DLL_LATE = os.path.join(SAMPLES, "soundvoltex-2025120900.dll")  # Exceed/Nabla EXTRACT + Cubism Normal 760
+DLL_MID = os.path.join(SAMPLES, "soundvoltex-2021121400.dll")  # Exceed-era full Cubism FX (4157)
+DLL_EARLY = os.path.join(SAMPLES, "soundvoltex-2020011500.dll")  # Early full Cubism FX (3130)
 
 # (name, src_len, profile, entry, marker, must_all, must_not)
 # must_all / must_not are tuples of bytes substrings.
 EXTRACT = [
+    # Same length/profile/entry as csm_premult_ps; content keys distinguish them.
+    ("filter_rgb_ps", 760, "ps_3_0", "PixelShaderEntryPoint", b"rgbStrength", (b"uvR", b"uvG"), (b"multiplyColor",)),
     ("p3d_ps_mrt", 506, "ps_3_0", "PixelShaderEntryPoint", b"COLOR1", (b"samplerTexture",), ()),
     ("p3d_ps_tex", 440, "ps_3_0", "PixelShaderEntryPoint", b"tex2D(samplerTexture", (b"PixelShaderEntryPoint",), (b"COLOR1",)),
     ("p3d_ps_color", 364, "ps_3_0", "PixelShaderEntryPoint", b"PixelShaderOutput", (b"PixelShaderEntryPoint",), (b"sampler",)),
@@ -383,7 +389,8 @@ def find_shader(
     )
 
 
-def compile_one(name: str, src: bytes, profile: str, entry: str, src_len: int):
+def compile_one(name: str, src: bytes, profile: str, entry: str, src_len: int,
+                match_src: bytes | None = None):
     hlsl_path = os.path.join(HERE, name + ".hlsl")
     cso_path = os.path.join(HERE, name + ".cso")
     with open(hlsl_path, "wb") as f:
@@ -397,7 +404,8 @@ def compile_one(name: str, src: bytes, profile: str, entry: str, src_len: int):
         raise SystemExit(r.returncode)
     with open(cso_path, "rb") as f:
         cso = f.read()
-    key = fnv1a64(src + b"\0" + entry.encode() + b"\0" + profile.encode())
+    key = (fnv1a64(match_src + b"\0" + entry.encode() + b"\0" + profile.encode())
+           if match_src is not None else 0)
     print(f"  {name}: match_src_len={src_len} cso={len(cso)}")
     return (name, profile, entry, src_len, key, cso)
 
@@ -429,38 +437,74 @@ def emit_bytes_array(lines: list[str], symbol: str, blob: bytes) -> None:
     lines.append("")
 
 
+def legacy_effect(dll_path: str, length: int, marker: bytes) -> bytes:
+    name = f"cubism_full_{length}"
+    if os.path.isfile(dll_path):
+        with open(dll_path, "rb") as f:
+            source = find_shader(f.read(), b"ShaderNames_SetupMask", length, (marker,), ())
+        return compile_fx(name, source, length)[2]
+    # Preserve the existing historical Live2D resources when rebuilding from a
+    # current game DLL. Their provenance and hashes are recorded beside them.
+    expected = {
+        3130: "464dd2b4294f6e7af100ae2e45692ca13fe1138b8f60b2edea1037853cd61d4c",
+        4157: "c866b9b70d074d2d4d3cbf8c203248a4c32cf5b05d1c8175970e6b7b1a14d749",
+    }
+    with open(os.path.join(HERE, "precompiled", name + ".fxo"), "rb") as f:
+        fxo = f.read()
+    if hashlib.sha256(fxo).hexdigest() != expected[length]:
+        raise ValueError(f"unexpected precompiled Effect contents: {name}")
+    print(f"  {name}: using verified existing FXO ({len(fxo)} bytes)")
+    return fxo
+
+
 def main() -> int:
+    global FXC
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-dll", help="Override the source DLL selected from samples/")
+    parser.add_argument("--fxc", default=os.environ.get("FXC", FXC))
+    args = parser.parse_args()
+    FXC = args.fxc
     if not os.path.isfile(FXC):
         print("fxc not found:", FXC, file=sys.stderr)
         return 1
-    for path in (DLL_LATE, DLL_MID, DLL_EARLY):
-        if not os.path.isfile(path):
-            print("DLL not found:", path, file=sys.stderr)
-            return 1
-
-    late = open(DLL_LATE, "rb").read()
-    mid = open(DLL_MID, "rb").read()
-    early = open(DLL_EARLY, "rb").read()
+    source_path = args.source_dll or DLL_LATE
+    if not args.source_dll and not os.path.isfile(source_path):
+        samples = sorted(glob.glob(os.path.join(SAMPLES, "soundvoltex-*.dll")))
+        if samples:
+            source_path = samples[0]
+    if not os.path.isfile(source_path):
+        parser.error("provide --source-dll or place a source DLL in samples/")
+    for dll_path, length in ((DLL_EARLY, 3130), (DLL_MID, 4157)):
+        fxo_path = os.path.join(HERE, "precompiled", f"cubism_full_{length}.fxo")
+        if not os.path.isfile(dll_path) and not os.path.isfile(fxo_path):
+            parser.error(
+                f"missing historical Cubism resource: {fxo_path}. "
+                f"Restore the bundled FXO, or supply {dll_path} in samples/."
+            )
+    print("HLSL input:", source_path)
+    with open(source_path, "rb") as f:
+        late = f.read()
     entries = []
 
     for name, src_len, profile, entry, marker, must_all, must_not in EXTRACT:
         src = find_shader(late, marker, src_len, must_all, must_not)
-        entries.append(compile_one(name, src, profile, entry, src_len))
+        entries.append(compile_one(name, src, profile, entry, src_len, match_src=src))
 
     for name, src_len, profile, entry, rewrite in REWRITES:
         src = rewrite.encode("ascii")
-        entries.append(compile_one(name, src, profile, entry, src_len))
+        try:
+            original = find_shader(late, entry.encode("ascii"), src_len)
+        except ValueError:
+            if name != "afp_hsv_legacy_ps":
+                raise
+            original = None
+            print("Legacy HSV original unavailable; using guarded legacy signature")
+        entries.append(compile_one(name, src, profile, entry, src_len, match_src=original))
 
     fx_late = find_shader(late, b"ShaderNames_Normal", 760, (b"PixelNormal",), ())
-    fx_full_early = find_shader(
-        early, b"ShaderNames_SetupMask", 3130, (b"ShaderNames_Normal",), ()
-    )
-    fx_full_mid = find_shader(
-        mid, b"ShaderNames_SetupMask", 4157, (b"ShaderNames_NormalMaskedInverted",), ()
-    )
     _, _, fxo_late = compile_fx("cubism_normal", fx_late, 760)
-    _, _, fxo_full_early = compile_fx("cubism_full_3130", fx_full_early, 3130)
-    _, _, fxo_full_mid = compile_fx("cubism_full_4157", fx_full_mid, 4157)
+    fxo_full_early = legacy_effect(DLL_EARLY, 3130, b"ShaderNames_Normal")
+    fxo_full_mid = legacy_effect(DLL_MID, 4157, b"ShaderNames_NormalMaskedInverted")
 
     lines = [
         "/* Auto-generated by shaders/gen_bytecode.py — do not edit */",
@@ -503,7 +547,7 @@ def main() -> int:
     lines.append("};")
     lines.append("")
 
-    with open(OUT_H, "w", newline="\n") as f:
+    with open(OUT_H, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
     print(
         "Wrote",

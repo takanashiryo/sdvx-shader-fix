@@ -12,7 +12,7 @@
 #include "shaders_bytecode.h"
 
 /*
- * Spice -k hook for SOUND VOLTEX on Wine (Nabla KFC:A:G:A:2025120900 / 2026040700 + older).
+ * Spice -k shader compatibility hook for SOUND VOLTEX (native Windows / Wine).
  *
  * Wine's D3DXCompileShader fails (or succeeds inconsistently) on Pseudo3d,
  * AFP, and Cubism Live2D shaders. Mixing Wine-compiled VS with fxc PS breaks
@@ -21,7 +21,7 @@
  * Also: Cubism's Normal technique uses D3DXCreateEffect; Wine fails that
  * compile so Live2D never gets past draw early-outs.
  *
- * Fix: on known (src_len, profile, entry) matches, return fxc-precompiled
+ * Fix: on known source/profile/entry matches, return fxc-precompiled
  * bytecode. With force_fxc=1, also replace successful Wine compiles so VS/PS
  * always come from the same compiler. For Cubism FX, feed an fxc .fxo into
  * D3DXCreateEffect (Normal-only 760; full multi-technique 3130 / 4157).
@@ -154,17 +154,58 @@ static int ini_int(const wchar_t *key, int def)
     return (int)GetPrivateProfileIntW(L"sdvx_shader_fix", key, def, ini);
 }
 
+static int src_contains(LPCVOID pSrcData, UINT src_len, const char *needle);
+
+static uint64_t shader_key(LPCSTR src, UINT src_len, LPCSTR entry, LPCSTR profile)
+{
+    uint64_t h = 0xCBF29CE484222325ULL;
+    for (UINT i = 0; i < src_len; ++i) {
+        h ^= (uint8_t)src[i];
+        h *= 0x100000001B3ULL;
+    }
+    // Include the two NUL separators used by the offline generator.
+    h *= 0x100000001B3ULL;
+    for (; *entry; ++entry) {
+        h ^= (uint8_t)*entry;
+        h *= 0x100000001B3ULL;
+    }
+    h *= 0x100000001B3ULL;
+    for (; *profile; ++profile) {
+        h ^= (uint8_t)*profile;
+        h *= 0x100000001B3ULL;
+    }
+    return h;
+}
+
 static const SdvxShaderBlob *find_blob(LPCSTR src, UINT src_len, LPCSTR entry, LPCSTR profile)
 {
     int i;
-    (void)src;
-    if (!entry || !profile)
+    uint64_t key = 0;
+    bool have_key = false;
+    if (!src || !entry || !profile)
         return NULL;
     for (i = 0; i < SDVX_SHADER_BLOB_COUNT; i++) {
-        if (g_sdvx_shader_blobs[i].src_len == src_len &&
-            strcmp(g_sdvx_shader_blobs[i].profile, profile) == 0 &&
-            strcmp(g_sdvx_shader_blobs[i].entry, entry) == 0)
-            return &g_sdvx_shader_blobs[i];
+        const SdvxShaderBlob *blob = &g_sdvx_shader_blobs[i];
+        if (blob->src_len != src_len || strcmp(blob->profile, profile) != 0 ||
+            strcmp(blob->entry, entry) != 0)
+            continue;
+        if (blob->key) {
+            if (!have_key) {
+                key = shader_key(src, src_len, entry, profile);
+                have_key = true;
+            }
+            if (blob->key == key)
+                return blob;
+        } else if (strcmp(blob->name, "afp_hsv_legacy_ps") == 0 &&
+                   src_contains(src, src_len, "func_rgb_to_hls") &&
+                   src_contains(src, src_len, "SrcSampler") &&
+                   src_contains(src, src_len, "g_hue") &&
+                   src_contains(src, src_len, "g_saturation") &&
+                   src_contains(src, src_len, "g_value")) {
+            // Preserve the historical rewrite when its original DLL is absent
+            // at build time. Never use a zero key as a general length wildcard.
+            return blob;
+        }
     }
     return NULL;
 }
@@ -378,7 +419,9 @@ static HRESULT WINAPI detour_compile(
         pSrcData, SrcDataLen, pDefines, pInclude, pFunctionName, pProfile, Flags,
         ppShader, ppErrorMsgs, ppConstantTable);
 
-    const SdvxShaderBlob *blob = find_blob(pSrcData, SrcDataLen, pFunctionName, pProfile);
+    const SdvxShaderBlob *blob = NULL;
+    if ((!pDefines || !pDefines->Name) && !pInclude)
+        blob = find_blob(pSrcData, SrcDataLen, pFunctionName, pProfile);
     if (g_log_verbose || (blob && g_fallback) || FAILED(hr)) {
         log_msg(
             "D3DXCompileShader profile=%s entry=%s src_len=%u hr=0x%08X blob=%s",
